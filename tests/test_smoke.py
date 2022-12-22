@@ -1268,7 +1268,7 @@ def test_spot(generic_cloud: str):
             f'sky spot cancel -y -n {name}-1',
             'sleep 10',
             f'{_SPOT_QUEUE_WAIT}| grep {name}-1 | head -n1 | grep CANCELLED',
-            'sleep 200',
+            'sleep 300',
             f'{_SPOT_QUEUE_WAIT}| grep {name}-2 | head -n1 | grep "RUNNING\|SUCCEEDED"',
         ],
         f'sky spot cancel -y -n {name}-1; sky spot cancel -y -n {name}-2',
@@ -1287,7 +1287,7 @@ def test_spot_failed_setup(generic_cloud: str):
         'spot-failed-setup',
         [
             f'sky spot launch -n {name} --cloud {generic_cloud} -y -d tests/test_yamls/failed_setup.yaml',
-            'sleep 200',
+            'sleep 300',
             # Make sure the job failed quickly.
             f'{_SPOT_QUEUE_WAIT} | grep {name} | head -n1 | grep "FAILED_SETUP"',
         ],
@@ -1303,6 +1303,9 @@ def test_spot_failed_setup(generic_cloud: str):
 @pytest.mark.managed_spot
 def test_spot_recovery_aws():
     """Test managed spot recovery."""
+    # TODO(suquark): The sleep time is flaky, sometime the test fails due to
+    #  no spot instance available for a long time.
+    #  We should wait status with a timeout instead.
     name = _get_cluster_name()
     region = 'us-west-2'
     test = Test(
@@ -1397,12 +1400,11 @@ def test_spot_recovery_multi_node_aws():
             (f'aws ec2 terminate-instances --region {region} --instance-ids $('
              f'aws ec2 describe-instances --region {region} '
              f'--filters Name=tag:ray-cluster-name,Values={name}* '
-             'Name=tag:ray-node-type,Values=worker '
              f'--query Reservations[].Instances[].InstanceId '
-             '--output text)'),
+             '--output text | sed "s/\t/\n/g" | sort | tail -n 1)'),
             'sleep 50',
             f'{_SPOT_QUEUE_WAIT}| grep {name} | head -n1 | grep "RECOVERING"',
-            'sleep 500',
+            'sleep 700',
             f'{_SPOT_QUEUE_WAIT}| grep {name} | head -n1 | grep "RUNNING"',
             f'RUN_ID=$(cat /tmp/{name}-run-id); echo $RUN_ID; sky spot logs -n {name} --no-follow | grep SKYPILOT_JOB_ID | cut -d: -f2 | grep "$RUN_ID"',
         ],
