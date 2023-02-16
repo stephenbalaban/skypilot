@@ -703,7 +703,7 @@ class SSHConfigHelper(object):
 
 def _replace_yaml_dicts(new_yaml: str, old_yaml: str,
                         restore_key_names: Set[str],
-                        exclude_restore_key_names: Set[List[str]]) -> str:
+                        exclude_restore_key_names: List[List[str]]) -> str:
     """Replaces 'new' with 'old' for all keys in key_names.
 
     The replacement will be applied recursively and only for the blocks
