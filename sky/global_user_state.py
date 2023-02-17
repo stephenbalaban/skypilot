@@ -190,6 +190,7 @@ def add_or_update_cluster(cluster_name: str,
 
     # if this is the cluster init or we are starting after a stop
     if len(usage_intervals) == 0 or usage_intervals[-1][-1] is not None:
+        assert cluster_launched_at is not None, usage_intervals
         usage_intervals.append((cluster_launched_at, None))
 
     if requested_resources:
@@ -416,7 +417,7 @@ def set_cluster_metadata(cluster_name: str, metadata: Dict[str, Any]) -> None:
 
 
 def _get_cluster_usage_intervals(
-        cluster_hash: str) -> Optional[List[Tuple[str, Optional[str]]]]:
+        cluster_hash: str) -> Optional[List[Tuple[int, Optional[int]]]]:
     rows = _DB.cursor.execute(
         'SELECT usage_intervals FROM cluster_history WHERE cluster_hash=(?)',
         (cluster_hash,))
