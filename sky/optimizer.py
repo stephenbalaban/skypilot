@@ -88,11 +88,24 @@ class Optimizer:
         return egress_time
 
     @staticmethod
-    def optimize(dag: 'dag_lib.Dag',
-                 minimize=OptimizeTarget.COST,
-                 blocked_launchable_resources: Optional[Iterable[
+    def optimize(
+            dag: 'dag_lib.Dag',
+            minimize=OptimizeTarget.COST,
+            blocked_resources: Optional[Iterable[
                      resources_lib.Resources]] = None,
-                 quiet: bool = False):
+            quiet: bool = False):
+        """Find the best execution plan for the given DAG.
+
+        Args:
+            dag: the DAG to optimize.
+            minimize: whether to minimize cost or time.
+            blocked_resources: a list of resources that should not be used.
+            quiet: whether to suppress logging.
+
+        Raises:
+            exceptions.ResourcesUnavailableError: if no resources are available
+                for a task.
+        """
         # This function is effectful: mutates every node in 'dag' by setting
         # node.best_resources if it is None.
         Optimizer._add_dummy_source_sink_nodes(dag)
@@ -100,7 +113,7 @@ class Optimizer:
             unused_best_plan = Optimizer._optimize_objective(
                 dag,
                 minimize_cost=minimize == OptimizeTarget.COST,
-                blocked_launchable_resources=blocked_launchable_resources,
+                blocked_resources=blocked_resources,
                 quiet=quiet)
         finally:
             # Make sure to remove the dummy source/sink nodes, even if the
@@ -238,7 +251,7 @@ class Optimizer:
                 launchable_resources, cloud_candidates = \
                     _fill_in_launchable_resources(
                         node,
-                        blocked_launchable_resources
+                        blocked_resources
                     )
                 node_to_candidate_map[node] = cloud_candidates
             else:
@@ -792,7 +805,7 @@ class Optimizer:
             Optimizer._estimate_nodes_cost_or_time(
                 topo_order,
                 minimize_cost,
-                blocked_launchable_resources)
+                blocked_resources)
 
         if dag.is_chain():
             best_plan, best_total_objective = Optimizer._optimize_by_dp(
@@ -886,8 +899,8 @@ def _filter_out_blocked_launchable_resources(
     """Whether the resources are blocked."""
     available_resources = []
     for resources in launchable_resources:
-        for blocked_resources in blocked_launchable_resources:
-            if resources.should_be_blocked_by(blocked_resources):
+        for blocked in blocked_resources:
+            if resources.should_be_blocked_by(blocked):
                 break
         else:  # non-blocked launchable resources. (no break)
             available_resources.append(resources)
@@ -914,8 +927,8 @@ def _fill_in_launchable_resources(
             if try_fix_with_sky_check:
                 # Explicitly check again to update the enabled cloud list.
                 check.check(quiet=True)
-                return _fill_in_launchable_resources(
-                    task, blocked_launchable_resources, False)
+                return _fill_in_launchable_resources(task, blocked_resources,
+                                                     False)
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.ResourcesUnavailableError(
                     f'Task {task} requires {resources.cloud} which is not '
@@ -940,8 +953,8 @@ def _fill_in_launchable_resources(
             launchable[resources] = _make_launchables_for_valid_region_zones(
                 resources)
         else:
-            clouds_list = [resources.cloud
-                          ] if resources.cloud is not None else enabled_clouds
+            clouds_list = ([resources.cloud]
+                           if resources.cloud is not None else enabled_clouds)
             # Hack: When >=2 cloud candidates, always remove local cloud from
             # possible candidates. This is so the optimizer will consider
             # public clouds, except local. Local will be included as part of
@@ -953,8 +966,8 @@ def _fill_in_launchable_resources(
                 ]
             all_fuzzy_candidates = set()
             for cloud in clouds_list:
-                (feasible_resources, fuzzy_candidate_list
-                ) = cloud.get_feasible_launchable_resources(resources)
+                (feasible_resources, fuzzy_candidate_list) = (
+                    cloud.get_feasible_launchable_resources(resources))
                 if len(feasible_resources) > 0:
                     # Assume feasible_resources is sorted by prices.
                     cheapest = feasible_resources[0]
@@ -965,15 +978,19 @@ def _fill_in_launchable_resources(
                 else:
                     all_fuzzy_candidates.update(fuzzy_candidate_list)
             if len(launchable[resources]) == 0:
-                logger.info(f'No resource satisfying {resources.accelerators} '
+                logger.info(f'No resource satisfying {resources} '
                             f'on {clouds_list}.')
                 if len(all_fuzzy_candidates) > 0:
                     logger.info('Did you mean: '
                                 f'{colorama.Fore.CYAN}'
                                 f'{sorted(all_fuzzy_candidates)}'
                                 f'{colorama.Style.RESET_ALL}')
+                elif resources.cpus is not None:
+                    logger.info('Try specifying a different CPU count, '
+                                'or add "+" to the end of the CPU count '
+                                'to allow for larger instances.')
 
         launchable[resources] = _filter_out_blocked_launchable_resources(
-            launchable[resources], blocked_launchable_resources)
+            launchable[resources], blocked_resources)
 
     return launchable, cloud_candidates

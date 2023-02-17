@@ -23,6 +23,7 @@ import colorama
 
 import sky
 from sky import backends
+from sky import clouds
 from sky import exceptions
 from sky import global_user_state
 from sky import optimizer
@@ -117,6 +118,9 @@ def _execute(
     detach_run: bool = False,
     idle_minutes_to_autostop: Optional[int] = None,
     no_setup: bool = False,
+    # Internal only:
+    # pylint: disable=invalid-name
+    _is_launched_by_spot_controller: bool = False,
 ) -> None:
     """Execute a entrypoint.
 
@@ -171,8 +175,16 @@ def _execute(
         existing_handle = global_user_state.get_handle_from_cluster_name(
             cluster_name)
         cluster_exists = existing_handle is not None
+        # TODO(woosuk): If the cluster exists, print a warning that
+        # `cpus` is not used as a job scheduling constraint, unlike `gpus`.
 
     stages = stages if stages is not None else list(Stage)
+
+    # Requested features that some clouds support and others don't.
+    requested_features = set()
+
+    if task.num_nodes > 1:
+        requested_features.add(clouds.CloudImplementationFeatures.MULTI_NODE)
 
     backend = backend if backend is not None else backends.CloudVmRayBackend()
     if isinstance(backend, backends.CloudVmRayBackend):
@@ -194,6 +206,11 @@ def _execute(
                             f'{colorama.Style.RESET_ALL}')
                 idle_minutes_to_autostop = 1
             stages.remove(Stage.DOWN)
+
+            if not down:
+                requested_features.add(
+                    clouds.CloudImplementationFeatures.AUTOSTOP)
+
     elif idle_minutes_to_autostop is not None:
         # TODO(zhwu): Autostop is not supported for non-CloudVmRayBackend.
         with ux_utils.print_exception_no_traceback():
@@ -201,20 +218,35 @@ def _execute(
                 f'Backend {backend.NAME} does not support autostop, please try '
                 f'{backends.CloudVmRayBackend.NAME}')
 
-    if not cluster_exists and Stage.OPTIMIZE in stages:
-        if task.best_resources is None:
-            # TODO: fix this for the situation where number of requested
-            # accelerators is not an integer.
-            if isinstance(backend, backends.CloudVmRayBackend):
-                # TODO: adding this check because docker backend on a
-                # no-credential machine should not enter optimize(), which
-                # would directly error out ('No cloud is enabled...').  Fix by
-                # moving `sky check` checks out of optimize()?
-                dag = sky.optimize(dag, minimize=optimize_target)
-                task = dag.tasks[0]  # Keep: dag may have been deep-copied.
-                assert task.best_resources is not None, task
+    if not cluster_exists:
+        if (Stage.PROVISION in stages and task.use_spot and
+                not _is_launched_by_spot_controller):
+            yellow = colorama.Fore.YELLOW
+            bold = colorama.Style.BRIGHT
+            reset = colorama.Style.RESET_ALL
+            logger.info(
+                f'{yellow}Launching an unmanaged spot task, which does not '
+                f'automatically recover from preemptions.{reset}\n{yellow}To '
+                'get automatic recovery, use managed spot instead: '
+                f'{reset}{bold}sky spot launch{reset} {yellow}or{reset} '
+                f'{bold}sky.spot_launch(){reset}.')
 
-    backend.register_info(dag=dag, optimize_target=optimize_target)
+        if Stage.OPTIMIZE in stages:
+            if task.best_resources is None:
+                # TODO: fix this for the situation where number of requested
+                # accelerators is not an integer.
+                if isinstance(backend, backends.CloudVmRayBackend):
+                    # TODO: adding this check because docker backend on a
+                    # no-credential machine should not enter optimize(), which
+                    # would directly error out ('No cloud is enabled...').  Fix
+                    # by moving `sky check` checks out of optimize()?
+                    dag = sky.optimize(dag, minimize=optimize_target)
+                    task = dag.tasks[0]  # Keep: dag may have been deep-copied.
+                    assert task.best_resources is not None, task
+
+    backend.register_info(dag=dag,
+                          optimize_target=optimize_target,
+                          requested_features=requested_features)
 
     if task.storage_mounts is not None:
         # Optimizer should eventually choose where to store bucket
@@ -298,6 +330,9 @@ def launch(
     detach_setup: bool = False,
     detach_run: bool = False,
     no_setup: bool = False,
+    # Internal only:
+    # pylint: disable=invalid-name
+    _is_launched_by_spot_controller: bool = False,
 ) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Launch a task.
@@ -354,6 +389,20 @@ def launch(
                 sky.Resources(cloud=sky.AWS(), accelerators='V100:4'))
             sky.launch(task, cluster_name='my-cluster')
 
+    Raises:
+        exceptions.ClusterOwnerIdentityMismatchError: if the cluster is
+            owned by another user.
+        exceptions.ResourcesUnavailableError: if the requested resources
+            cannot be satisfied. The failover_history of the exception
+            will be set as:
+                1. Empty: iff the first-ever sky.optimize() fails to
+                find a feasible resource; no pre-check or actual launch is
+                attempted.
+                2. Non-empty: iff at least 1 exception from either
+                our pre-checks (e.g., cluster name invalid) or a region/zone
+                throwing resource unavailability.
+        exceptions.NotSupportedError: if the cluster name is reserved.
+    Other exceptions may be raised depending on the backend.
     """
     entrypoint = task
     backend_utils.check_cluster_name_not_reserved(cluster_name,
@@ -372,6 +421,7 @@ def launch(
         detach_run=detach_run,
         idle_minutes_to_autostop=idle_minutes_to_autostop,
         no_setup=no_setup,
+        _is_launched_by_spot_controller=_is_launched_by_spot_controller,
     )
 
 
@@ -427,6 +477,8 @@ def exec(  # pylint: disable=redefined-builtin
     Raises:
         ValueError: if the specified cluster does not exist or is not in UP
             status.
+        sky.exceptions.NotSupportedError: if the specified cluster is a
+            reserved cluster that does not support this operation.
     """
     entrypoint = task
     if isinstance(entrypoint, sky.Dag):
@@ -573,6 +625,7 @@ def spot_launch(
         controller_task = task_lib.Task.from_yaml(yaml_path)
         controller_task.spot_task = task
         assert len(controller_task.resources) == 1
+
         print(f'{colorama.Fore.YELLOW}'
               f'Launching managed spot job {name} from spot controller...'
               f'{colorama.Style.RESET_ALL}')

@@ -184,7 +184,7 @@ def check_and_install_local_env(ips: Sequence[str], auth_config: Dict[str,
     def _install_and_check_dependencies(
             runner: command_runner.SSHCommandRunner) -> None:
         # Checks for python3 installation.
-        python_version = _run_command_and_handle_ssh_failure(
+        python_version = backend_utils.run_command_and_handle_ssh_failure(
             runner, ('python3 --version'),
             failure_message=f'Python3 is not installed on {runner.ip}.')
         python_version = python_version.split(' ')[-1].strip()
@@ -196,19 +196,19 @@ def check_and_install_local_env(ips: Sequence[str], auth_config: Dict[str,
                 f'the minimum requirement: Python {min_python_version}.')
 
         # Checks for pip3 installation.
-        _run_command_and_handle_ssh_failure(
+        backend_utils.run_command_and_handle_ssh_failure(
             runner, ('pip3 --version'),
             failure_message=f'Pip3 is not installed on {runner.ip}.')
 
         # If Ray does not exist, installs Ray.
-        _run_command_and_handle_ssh_failure(
+        backend_utils.run_command_and_handle_ssh_failure(
             runner, ('ray --version || '
                      f'(pip3 install ray[default]=={sky_ray_version})'),
             failure_message=f'Ray is not installed on {runner.ip}.')
 
         # If Ray exists, check Ray version. If the version does not match
         # raise an error.
-        _run_command_and_handle_ssh_failure(
+        backend_utils.run_command_and_handle_ssh_failure(
             runner,
             f'ray --version | grep {sky_ray_version}',
             failure_message=(
@@ -224,13 +224,13 @@ def check_and_install_local_env(ips: Sequence[str], auth_config: Dict[str,
         # since the last SkyPilot release. If required, please install
         # skypilot from source on the onprem machine(s) before running sky
         # admin deploy
-        _run_command_and_handle_ssh_failure(
+        backend_utils.run_command_and_handle_ssh_failure(
             runner,
             'sky --help || (pip3 install skypilot)',
             failure_message=f'Sky is not installed on {runner.ip}.')
 
         # Patches global Ray.
-        _run_command_and_handle_ssh_failure(
+        backend_utils.run_command_and_handle_ssh_failure(
             runner, ('python3 -c "from sky.skylet.ray_patches '
                      'import patch; patch()"'),
             failure_message=f'Failed to patch ray on {runner.ip}.')
@@ -309,7 +309,7 @@ def get_local_cluster_accelerators(
                          target=_SKY_GET_ACCELERATORS_SCRIPT_PATH,
                          up=True,
                          stream_logs=False)
-            output = _run_command_and_handle_ssh_failure(
+            output = backend_utils.run_command_and_handle_ssh_failure(
                 runner,
                 f'python3 {_SKY_GET_ACCELERATORS_SCRIPT_PATH}',
                 failure_message=f'Fail to fetch accelerators on {runner.ip}')
@@ -363,7 +363,7 @@ def launch_ray_on_local_cluster(
     with console.status('[bold cyan]Stopping ray cluster'):
 
         def _stop_ray_workers(runner: command_runner.SSHCommandRunner):
-            _run_command_and_handle_ssh_failure(
+            backend_utils.run_command_and_handle_ssh_failure(
                 runner,
                 'ray stop -f',
                 failure_message=f'Failed to stop ray on {runner.ip}.')
@@ -379,7 +379,7 @@ def launch_ray_on_local_cluster(
                 f'--resources={head_resources!r} --num-gpus={head_gpu_count}')
 
     with console.status('[bold cyan]Launching ray cluster on head'):
-        _run_command_and_handle_ssh_failure(
+        backend_utils.run_command_and_handle_ssh_failure(
             head_runner,
             head_cmd,
             failure_message='Failed to launch ray on head node.')
@@ -409,7 +409,7 @@ def launch_ray_on_local_cluster(
         def _start_ray_workers(
                 runner_tuple: Tuple[command_runner.SSHCommandRunner, int]):
             runner, idx = runner_tuple
-            _run_command_and_handle_ssh_failure(
+            backend_utils.run_command_and_handle_ssh_failure(
                 runner,
                 'ray stop -f',
                 failure_message=f'Failed to stop ray on {runner.ip}.')
@@ -421,7 +421,7 @@ def launch_ray_on_local_cluster(
                           '--object-manager-port=8076 --dashboard-port 8265 '
                           f'--resources={worker_resources!r} '
                           f'--num-gpus={worker_gpu_count}')
-            _run_command_and_handle_ssh_failure(
+            backend_utils.run_command_and_handle_ssh_failure(
                 runner,
                 worker_cmd,
                 failure_message=
@@ -440,7 +440,7 @@ def launch_ray_on_local_cluster(
                              up=True,
                              stream_logs=False)
             # Kill existing dashboard connection and launch new one
-            _run_command_and_handle_ssh_failure(
+            backend_utils.run_command_and_handle_ssh_failure(
                 runner, f'chmod a+rwx {dashboard_remote_path};'
                 'screen -S ray-dashboard -X quit;'
                 f'screen -S ray-dashboard -dm {dashboard_remote_path}',
@@ -467,7 +467,7 @@ def save_distributable_yaml(cluster_config: Dict[str, Any]) -> None:
     # Admin authentication must be censored out.
     cluster_config['auth']['ssh_user'] = AUTH_PLACEHOLDER
     cluster_config['auth']['ssh_private_key'] = AUTH_PLACEHOLDER
-    cluster_config['python'] = _run_command_and_handle_ssh_failure(
+    cluster_config['python'] = backend_utils.run_command_and_handle_ssh_failure(
         head_runner,
         'which python3',
         failure_message='Failed to obtain admin python path.').split()[0]
@@ -517,27 +517,6 @@ def check_local_cloud_args(cloud: Optional[str] = None,
         return False
 
 
-def _run_command_and_handle_ssh_failure(runner: command_runner.SSHCommandRunner,
-                                        command: str,
-                                        failure_message: str) -> str:
-    """Runs command remotely and returns output with proper error handling."""
-    rc, stdout, stderr = runner.run(command,
-                                    require_outputs=True,
-                                    stream_logs=False)
-    if rc == 255:
-        # SSH failed
-        raise RuntimeError(
-            f'SSH with user {runner.ssh_user} and key {runner.ssh_private_key} '
-            f'to {runner.ip} failed. This is most likely due to incorrect '
-            'credentials or incorrect permissions for the key file. Check '
-            'your credentials and try again.')
-    subprocess_utils.handle_returncode(rc,
-                                       command,
-                                       failure_message,
-                                       stderr=stderr)
-    return stdout
-
-
 def do_filemounts_and_setup_on_local_workers(
         cluster_config_file: str,
         worker_ips: Optional[List[str]] = None,
@@ -577,7 +556,7 @@ def do_filemounts_and_setup_on_local_workers(
         def _setup_local_worker(runner: command_runner.SSHCommandRunner):
             for dst, src in file_mounts.items():
                 mkdir_dst = f'mkdir -p {os.path.dirname(dst)}'
-                _run_command_and_handle_ssh_failure(
+                backend_utils.run_command_and_handle_ssh_failure(
                     runner,
                     mkdir_dst,
                     failure_message=f'Failed to run {mkdir_dst} on remote.')

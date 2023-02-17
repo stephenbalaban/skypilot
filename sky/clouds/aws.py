@@ -47,6 +47,14 @@ class AWS(clouds.Cloud):
     """Amazon Web Services."""
 
     _REPR = 'AWS'
+
+    # AWS has a limit of the tag value length to 256 characters.
+    # By testing, the actual limit is 256 - 12 = 244 characters
+    # (ray adds additional `ray-` and `-worker`), due to the
+    # maximum length of DescribeInstances API filter value.
+    # Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Tags.html # pylint: disable=line-too-long
+    _MAX_CLUSTER_NAME_LEN_LIMIT = 244
+
     _regions: List[clouds.Region] = []
 
     _INDENT_PREFIX = '    '
@@ -57,6 +65,15 @@ class AWS(clouds.Cloud):
         f'\n{_INDENT_PREFIX}For more info: '
         'https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-quickstart.html'  # pylint: disable=line-too-long
     )
+
+    @classmethod
+    def _cloud_unsupported_features(
+            cls) -> Dict[clouds.CloudImplementationFeatures, str]:
+        return dict()
+
+    @classmethod
+    def _max_cluster_name_length(cls) -> Optional[int]:
+        return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     def _sso_credentials_help_str(cls, expired: bool = False) -> str:
@@ -127,22 +144,23 @@ class AWS(clouds.Cloud):
         return regions
 
     @classmethod
-    def region_zones_provision_loop(
+    def zones_provision_loop(
         cls,
         *,
+        region: str,
         instance_type: Optional[str] = None,
         accelerators: Optional[Dict[str, int]] = None,
         use_spot: bool = False,
-    ) -> Iterator[Tuple[clouds.Region, List[clouds.Zone]]]:
+    ) -> Iterator[Optional[List[clouds.Zone]]]:
         # AWS provisioner can handle batched requests, so yield all zones under
         # each region.
         regions = cls.regions_with_offering(instance_type,
                                             accelerators,
                                             use_spot,
-                                            region=None,
+                                            region=region,
                                             zone=None)
-        for region in regions:
-            yield region, region.zones
+        for r in regions:
+            yield r.zones
 
     @classmethod
     def _get_default_ami(cls, region_name: str, instance_type: str) -> str:
@@ -274,9 +292,10 @@ class AWS(clouds.Cloud):
         return isinstance(other, AWS)
 
     @classmethod
-    def get_default_instance_type(cls) -> str:
-        # 8 vCpus, 32 GB RAM. 3rd generation Intel Xeon. General Purpose.
-        return 'm6i.2xlarge'
+    def get_default_instance_type(cls,
+                                  cpus: Optional[str] = None) -> Optional[str]:
+        return service_catalog.get_default_instance_type(cpus=cpus,
+                                                         clouds='aws')
 
     # TODO: factor the following three methods, as they are the same logic
     # between Azure and AWS.
@@ -305,9 +324,7 @@ class AWS(clouds.Cloud):
                 'Set either both or neither for: region, zones.')
             region = self._get_default_region()
             zones = region.zones
-        else:
-            assert zones is not None, (
-                'Set either both or neither for: region, zones.')
+        assert zones is not None, (region, zones)
 
         region_name = region.name
         zone_names = [zone.name for zone in zones]
@@ -333,12 +350,11 @@ class AWS(clouds.Cloud):
 
     def get_feasible_launchable_resources(self,
                                           resources: 'resources_lib.Resources'):
-        fuzzy_candidate_list: List[str] = []
         if resources.instance_type is not None:
             assert resources.is_launchable(), resources
             # Treat Resources(AWS, p3.2x, V100) as Resources(AWS, p3.2x).
             resources = resources.copy(accelerators=None)
-            return ([resources], fuzzy_candidate_list)
+            return ([resources], [])
 
         def _make(instance_list):
             resource_list = []
@@ -349,6 +365,7 @@ class AWS(clouds.Cloud):
                     # Setting this to None as AWS doesn't separately bill /
                     # attach the accelerators.  Billed as part of the VM type.
                     accelerators=None,
+                    cpus=None,
                 )
                 resource_list.append(r)
             return resource_list
@@ -356,9 +373,13 @@ class AWS(clouds.Cloud):
         # Currently, handle a filter on accelerators only.
         accelerators = resources.accelerators
         if accelerators is None:
-            # No requirements to filter, so just return a default VM type.
-            return (_make([AWS.get_default_instance_type()]),
-                    fuzzy_candidate_list)
+            # Return a default instance type with the given number of vCPUs.
+            default_instance_type = AWS.get_default_instance_type(
+                cpus=resources.cpus)
+            if default_instance_type is None:
+                return ([], [])
+            else:
+                return (_make([default_instance_type]), [])
 
         assert len(accelerators) == 1, resources
         acc, acc_count = list(accelerators.items())[0]
@@ -367,6 +388,7 @@ class AWS(clouds.Cloud):
             acc,
             acc_count,
             use_spot=resources.use_spot,
+            cpus=resources.cpus,
             region=resources.region,
             zone=resources.zone,
             clouds='aws')

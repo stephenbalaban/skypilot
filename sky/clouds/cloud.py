@@ -1,19 +1,37 @@
 """Interfaces: clouds, regions, and zones."""
 import collections
+import enum
+import re
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Type
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Type
 
+from sky import exceptions
 from sky.clouds import service_catalog
+from sky.utils import log_utils
 from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
     from sky import resources
 
 
+class CloudImplementationFeatures(enum.Enum):
+    """Features that might not be implemented for all clouds.
+
+    Used by Cloud.check_features_are_supported().
+
+    Note: If any new feature is added, please check and update
+    _cloud_unsupported_features in all clouds to make sure the
+    check_features_are_supported() works as expected.
+    """
+    STOP = 'stop'
+    AUTOSTOP = 'autostop'
+    MULTI_NODE = 'multi-node'
+
+
 class Region(collections.namedtuple('Region', ['name'])):
     """A region."""
     name: str
-    zones: List['Zone'] = []
+    zones: Optional[List['Zone']] = None
 
     def set_zones(self, zones: List['Zone']):
         self.zones = zones
@@ -55,6 +73,31 @@ class Cloud:
 
     _REPR = '<Cloud>'
 
+    @classmethod
+    def _cloud_unsupported_features(
+            cls) -> Dict[CloudImplementationFeatures, str]:
+        """The features not supported by the cloud implementation.
+
+        This method is used by check_features_are_supported() to check if the
+        cloud implementation supports all the requested features.
+
+        Returns:
+            A dict of {feature: reason} for the features not supported by the
+            cloud implementation.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def _max_cluster_name_length(cls) -> Optional[int]:
+        """Returns the maximum length limit of a cluster name.
+
+        This method is used by check_cluster_name_is_valid() to check if the
+        cluster name is too long.
+
+        None means no limit.
+        """
+        return None
+
     #### Regions/Zones ####
 
     @classmethod
@@ -83,14 +126,15 @@ class Cloud:
         raise NotImplementedError
 
     @classmethod
-    def region_zones_provision_loop(
+    def zones_provision_loop(
         cls,
         *,
+        region: str,
         instance_type: Optional[str] = None,
         accelerators: Optional[Dict[str, int]] = None,
         use_spot: bool = False,
-    ) -> Iterator[Tuple[Region, List[Zone]]]:
-        """Loops over (region, zones) to retry for provisioning.
+    ) -> Iterator[Optional[List[Zone]]]:
+        """Loops over zones to retry for provisioning in a given region.
 
         Certain clouds' provisioners may handle batched requests, retrying for
         itself a list of zones under a region.  Others may need a specific zone
@@ -100,9 +144,16 @@ class Cloud:
         instance_type, accelerators, and use_spot.
 
         Args:
+            region: The region to provision.
             instance_type: The instance type to provision.
             accelerators: The accelerators to provision.
             use_spot: Whether to use spot instances.
+
+        Yields:
+            A list of zones to provision in the given region, in the order of
+            price. If there is no zone that offers the specified resources,
+            nothing is yielded;
+            If the cloud does not support `Zone`s, None will be yielded.
 
         Typical usage:
 
@@ -180,7 +231,18 @@ class Cloud:
         raise NotImplementedError
 
     @classmethod
-    def get_default_instance_type(cls) -> str:
+    def get_default_instance_type(cls,
+                                  cpus: Optional[str] = None) -> Optional[str]:
+        """Returns the default instance type with the given number of vCPUs.
+
+        For example, if cpus='4', this method returns the default instance type
+        with 4 vCPUs.  If cpus='4+', this method returns the default instance
+        type with 4 or more vCPUs.
+
+        When cpus is None, this method will never return None.
+        This method may return None if the cloud's default instance family
+        does not have a VM with the given number of vCPUs (e.g., when cpus='7').
+        """
         raise NotImplementedError
 
     @classmethod
@@ -296,6 +358,65 @@ class Cloud:
         """
         del resource
         return False
+
+    @classmethod
+    def check_features_are_supported(
+            cls, requested_features: Set[CloudImplementationFeatures]) -> None:
+        """Errors out if the cloud does not support all requested features.
+
+        For instance, Lambda Cloud does not support autostop, so
+        Lambda.check_features_are_supported({
+            CloudImplementationFeatures.AUTOSTOP
+        }) raises the exception.
+
+        Raises:
+            exceptions.NotSupportedError: If the cloud does not support all the
+            requested features.
+        """
+        unsupported_features2reason = cls._cloud_unsupported_features()
+        unsupported_features = set(unsupported_features2reason.keys())
+        unsupported_features = requested_features.intersection(
+            unsupported_features)
+        if unsupported_features:
+            table = log_utils.create_table(['Feature', 'Reason'])
+            for feature in unsupported_features:
+                table.add_row(
+                    [feature.value, unsupported_features2reason[feature]])
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.NotSupportedError(
+                    f'The following features are not supported by {cls._REPR}:'
+                    '\n\t' + table.get_string().replace('\n', '\n\t'))
+
+    @classmethod
+    def check_cluster_name_is_valid(cls, cluster_name: str) -> None:
+        """Errors out on invalid cluster names not supported by cloud providers.
+
+        Bans (including but not limited to) names that:
+        - are digits-only
+        - contain underscore (_)
+
+        Raises:
+            exceptions.InvalidClusterNameError: If the cluster name is invalid.
+        """
+        if cluster_name is None:
+            return
+        max_cluster_name_len_limit = cls._max_cluster_name_length()
+        valid_regex = '[a-z]([-a-z0-9]*[a-z0-9])?'
+        if re.fullmatch(valid_regex, cluster_name) is None:
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.InvalidClusterNameError(
+                    f'Cluster name "{cluster_name}" is invalid; '
+                    'ensure it is fully matched by regex (e.g., '
+                    'only contains lower letters, numbers and dash): '
+                    f'{valid_regex}')
+        if (max_cluster_name_len_limit is not None and
+                len(cluster_name) > max_cluster_name_len_limit):
+            cloud_name = '' if cls is Cloud else f' on {cls._REPR}'
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.InvalidClusterNameError(
+                    f'Cluster name {cluster_name!r} has {len(cluster_name)} '
+                    'chars; maximum length is '
+                    f'{max_cluster_name_len_limit} chars{cloud_name}.')
 
     def __repr__(self):
         return self._REPR

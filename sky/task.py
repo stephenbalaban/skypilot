@@ -395,6 +395,20 @@ class Task:
     def need_spot_recovery(self) -> bool:
         return any(r.spot_recovery is not None for r in self.resources)
 
+    @property
+    def use_spot(self) -> bool:
+        return any(r.use_spot for r in self.resources)
+
+    @num_nodes.setter
+    def num_nodes(self, num_nodes: Optional[int]) -> None:
+        if num_nodes is None:
+            num_nodes = 1
+        if not isinstance(num_nodes, int) or num_nodes <= 0:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    f'num_nodes should be a positive int. Got: {num_nodes}')
+        self._num_nodes = num_nodes
+
     def set_inputs(self, inputs, estimated_size_gigabytes) -> 'Task':
         # E.g., 's3://bucket', 'gs://bucket', or None.
         self.inputs = inputs
@@ -448,6 +462,7 @@ class Task:
         """
         if isinstance(resources, sky.Resources):
             resources = {resources}
+        # TODO(woosuk): Check if the resources are None.
         self.resources = resources
         return self
 

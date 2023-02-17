@@ -1,9 +1,11 @@
 """SDK functions for cluster/job management."""
-import colorama
 import getpass
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+import colorama
+
+from sky import clouds
 from sky import dag
 from sky import task
 from sky import backends
@@ -33,7 +35,10 @@ logger = sky_logging.init_logger(__name__)
 def status(cluster_names: Optional[Union[str, Sequence[str]]] = None,
            refresh: bool = False) -> List[Dict[str, Any]]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
-    """Get all cluster statuses.
+    """Get cluster statuses.
+
+    If cluster_names is given, return those clusters. Otherwise, return all
+    clusters.
 
     Each returned value has the following fields:
 
@@ -102,13 +107,63 @@ def status(cluster_names: Optional[Union[str, Sequence[str]]] = None,
                                       cluster_names=cluster_names)
 
 
+@usage_lib.entrypoint
+def cost_report() -> List[Dict[str, Any]]:
+    # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
+    """Get all cluster cost reports, including those that have been downed.
+
+    Each returned value has the following fields:
+
+    .. code-block:: python
+
+        {
+            'name': (str) cluster name,
+            'launched_at': (int) timestamp of last launch on this cluster,
+            'duration': (int) total seconds that cluster was up and running,
+            'last_use': (str) the last command/entrypoint that affected this
+            'num_nodes': (int) number of nodes launched for cluster,
+            'resources': (resources.Resources) type of resource launched,
+            'cluster_hash': (str) unique hash identifying cluster,
+            'usage_intervals': (List[Tuple[int, int]]) cluster usage times,
+            'total_cost': (float) cost given resources and usage intervals,
+        }
+
+
+        The estimated cost column indicates price for the cluster based on the
+        type of resources being used and the duration of use up until the call
+        to status. This means if the cluster is UP, successive calls to report
+        will show increasing price. The estimated cost is calculated based on
+        the local cache of the cluster status, and may not be accurate for
+        the cluster with autostop/use_spot set or terminated/stopped
+        on the cloud console.
+
+    Returns:
+        A list of dicts, with each dict containing the cost information of a
+        cluster.
+    """
+    cluster_reports = global_user_state.get_clusters_from_history()
+
+    def get_total_cost(cluster_report: dict) -> float:
+        duration = cluster_report['duration']
+        launched_nodes = cluster_report['num_nodes']
+        launched_resources = cluster_report['resources']
+
+        cost = (launched_resources.get_cost(duration) * launched_nodes)
+        return cost
+
+    for cluster_report in cluster_reports:
+        cluster_report['total_cost'] = get_total_cost(cluster_report)
+
+    return cluster_reports
+
+
 def _start(
     cluster_name: str,
     idle_minutes_to_autostop: Optional[int] = None,
     retry_until_up: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     force: bool = False,
-) -> backends.CloudVmRayBackend.ResourceHandle:
+) -> backends.CloudVmRayResourceHandle:
 
     cluster_status, handle = backend_utils.refresh_cluster_status_handle(
         cluster_name)
@@ -249,6 +304,18 @@ def stop(cluster_name: str, purge: bool = False) -> None:
     handle = global_user_state.get_handle_from_cluster_name(cluster_name)
     if handle is None:
         raise ValueError(f'Cluster {cluster_name!r} does not exist.')
+    if tpu_utils.is_tpu_vm_pod(handle.launched_resources):
+        # Reference:
+        # https://cloud.google.com/tpu/docs/managing-tpus-tpu-vm#stopping_a_with_gcloud  # pylint: disable=line-too-long
+        raise exceptions.NotSupportedError(
+            f'Stopping cluster {cluster_name!r} with TPU VM Pod '
+            'is not supported.')
+
+    # Check cloud supports stopping instances
+    cloud = handle.launched_resources.cloud
+    cloud.check_features_are_supported(
+        {clouds.CloudImplementationFeatures.STOP})
+
     backend = backend_utils.get_backend_from_handle(handle)
 
     if isinstance(backend, backends.CloudVmRayBackend):
@@ -368,6 +435,11 @@ def autostop(
         cluster_name,
         operation=operation,
     )
+    backend = backend_utils.get_backend_from_handle(handle)
+    if not isinstance(backend, backends.CloudVmRayBackend):
+        raise exceptions.NotSupportedError(
+            f'{operation} cluster {cluster_name!r} with backend '
+            f'{backend.__class__.__name__!r} is not supported.')
 
     if tpu_utils.is_tpu_vm_pod(handle.launched_resources):
         # Reference:
@@ -375,6 +447,12 @@ def autostop(
         raise exceptions.NotSupportedError(
             f'{operation} cluster {cluster_name!r} with TPU VM Pod '
             'is not supported.')
+
+    # Check autostop is implemented for cloud
+    cloud = handle.launched_resources.cloud
+    if not down and idle_minutes >= 0:
+        cloud.check_features_are_supported(
+            {clouds.CloudImplementationFeatures.AUTOSTOP})
 
     backend = backend_utils.get_backend_from_handle(handle)
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
@@ -456,12 +534,10 @@ def cancel(cluster_name: str,
     Please refer to the sky.cli.cancel for the document.
 
     Raises:
-        ValueError: arguments are invalid or the cluster is not supported or the
-          cluster does not exist.
-        ValueError: if the cluster does not exist.
+        ValueError: if arguments are invalid, or the cluster does not exist.
         sky.exceptions.ClusterNotUpError: if the cluster is not UP.
-        sky.exceptions.NotSupportedError: if the cluster is not based on
-          CloudVmRayBackend.
+        sky.exceptions.NotSupportedError: if the specified cluster is a
+          reserved cluster that does not support this operation.
         sky.exceptions.ClusterOwnerIdentityMismatchError: if the current user is
           not the same as the user who created the cluster.
         sky.exceptions.CloudUserIdentityError: if we fail to get the current
@@ -614,7 +690,7 @@ def job_status(
         raise exceptions.NotSupportedError(
             f'Getting job status is not supported for cluster {cluster_name!r} '
             f'of type {backend.__class__.__name__!r}.')
-    assert isinstance(handle, backends.CloudVmRayBackend.ResourceHandle), handle
+    assert isinstance(handle, backends.CloudVmRayResourceHandle), handle
 
     if job_ids is not None and len(job_ids) == 0:
         return {}
@@ -644,7 +720,8 @@ def spot_status(refresh: bool) -> List[Dict[str, Any]]:
 
 
 @usage_lib.entrypoint
-def spot_queue(refresh: bool) -> List[Dict[str, Any]]:
+def spot_queue(refresh: bool,
+               skip_finished: bool = False) -> List[Dict[str, Any]]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Get statuses of managed spot jobs.
 
@@ -707,6 +784,8 @@ def spot_queue(refresh: bool) -> List[Dict[str, Any]]:
         raise RuntimeError(e.error_msg) from e
 
     jobs = spot.load_spot_job_queue(job_table_payload)
+    if skip_finished:
+        jobs = list(filter(lambda job: not job['status'].is_terminal(), jobs))
     return jobs
 
 
@@ -784,7 +863,6 @@ def spot_tail_logs(name: Optional[str], job_id: Optional[int],
     controller_status, handle = spot.is_spot_controller_up(
         'Please restart the spot controller with '
         f'`sky start {spot.SPOT_CONTROLLER_NAME}`.')
-    assert isinstance(handle, backends.CloudVmRayBackend.ResourceHandle), handle
     if handle is None or handle.head_ip is None:
         msg = 'All jobs finished.'
         if controller_status == global_user_state.ClusterStatus.INIT:

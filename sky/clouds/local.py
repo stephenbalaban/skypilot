@@ -36,7 +36,22 @@ class Local(clouds.Cloud):
     """
     _DEFAULT_INSTANCE_TYPE = 'on-prem'
     LOCAL_REGION = clouds.Region('Local')
+    _CLOUD_UNSUPPORTED_FEATURES = {
+        clouds.CloudImplementationFeatures.STOP:
+            ('Local cloud does not support stopping instances.'),
+        clouds.CloudImplementationFeatures.AUTOSTOP:
+            ('Local cloud does not support stopping instances.')
+    }
     _regions: List[clouds.Region] = [LOCAL_REGION]
+
+    @classmethod
+    def _cloud_unsupported_features(
+            cls) -> Dict[clouds.CloudImplementationFeatures, str]:
+        return cls._CLOUD_UNSUPPORTED_FEATURES
+
+    @classmethod
+    def _max_cluster_name_length(cls) -> Optional[int]:
+        return None
 
     @classmethod
     def regions(cls):
@@ -52,20 +67,21 @@ class Local(clouds.Cloud):
         return cls.regions()
 
     @classmethod
-    def region_zones_provision_loop(
+    def zones_provision_loop(
         cls,
         *,
+        region: str,
         instance_type: Optional[str] = None,
         accelerators: Optional[Dict[str, int]] = None,
         use_spot: bool = False,
-    ) -> Iterator[Tuple[clouds.Region, List[clouds.Zone]]]:
+    ) -> Iterator[Optional[List[clouds.Zone]]]:
         regions = cls.regions_with_offering(instance_type,
                                             accelerators,
                                             use_spot=use_spot,
-                                            region=None,
+                                            region=region,
                                             zone=None)
-        for region in regions:
-            yield region, region.zones
+        for r in regions:
+            yield r.zones
 
     #### Normal methods ####
 
@@ -94,8 +110,9 @@ class Local(clouds.Cloud):
         return isinstance(other, Local)
 
     @classmethod
-    def get_default_instance_type(cls) -> str:
+    def get_default_instance_type(cls, cpus: Optional[str] = None) -> str:
         # There is only "1" instance type for local cloud: on-prem
+        del cpus  # Unused.
         return Local._DEFAULT_INSTANCE_TYPE
 
     @classmethod

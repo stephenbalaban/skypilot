@@ -43,7 +43,23 @@ class Azure(clouds.Cloud):
     """Azure."""
 
     _REPR = 'Azure'
+    # Azure has a 90 char limit for resource group; however, SkyPilot adds the
+    # suffix `-<region name>`. Azure also has a 64 char limit for VM names, and
+    # ray adds addtional `ray-`, `-worker`, and `-<9 chars hash>` for the VM
+    # names, so the limit is 64 - 4 - 7 - 10 = 43.
+    # Reference: https://azure.github.io/PSRule.Rules.Azure/en/rules/Azure.ResourceGroup.Name/ # pylint: disable=line-too-long
+    _MAX_CLUSTER_NAME_LEN_LIMIT = 42
+
     _regions: List[clouds.Region] = []
+
+    @classmethod
+    def _cloud_unsupported_features(
+            cls) -> Dict[clouds.CloudImplementationFeatures, str]:
+        return dict()
+
+    @classmethod
+    def _max_cluster_name_length(cls) -> int:
+        return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
@@ -94,9 +110,10 @@ class Azure(clouds.Cloud):
         return isinstance(other, Azure)
 
     @classmethod
-    def get_default_instance_type(cls) -> str:
-        # 8 vCpus, 32 GB RAM.  Prev-gen (as of 2021) general purpose.
-        return 'Standard_D8_v4'
+    def get_default_instance_type(cls,
+                                  cpus: Optional[str] = None) -> Optional[str]:
+        return service_catalog.get_default_instance_type(cpus=cpus,
+                                                         clouds='azure')
 
     def _get_image_config(self, gen_version, instance_type):
         # az vm image list \
@@ -156,6 +173,7 @@ class Azure(clouds.Cloud):
                               use_spot: bool, region: Optional[str],
                               zone: Optional[str]) -> List[clouds.Region]:
         del accelerators  # unused
+        assert zone is None, 'Azure does not support zones'
         if instance_type is None:
             # Fall back to default regions
             regions = cls.regions()
@@ -165,27 +183,24 @@ class Azure(clouds.Cloud):
 
         if region is not None:
             regions = [r for r in regions if r.name == region]
-        if zone is not None:
-            for r in regions:
-                r.set_zones([z for z in r.zones if z.name == zone])
-            regions = [r for r in regions if r.zones]
         return regions
 
     @classmethod
-    def region_zones_provision_loop(
+    def zones_provision_loop(
         cls,
         *,
+        region: str,
         instance_type: Optional[str] = None,
         accelerators: Optional[Dict[str, int]] = None,
         use_spot: bool = False,
-    ) -> Iterator[Tuple[clouds.Region, List[clouds.Zone]]]:
+    ) -> Iterator[Optional[List[clouds.Zone]]]:
         regions = cls.regions_with_offering(instance_type,
                                             accelerators,
                                             use_spot,
-                                            region=None,
+                                            region=region,
                                             zone=None)
-        for region in regions:
-            yield region, region.zones
+        for r in regions:
+            yield r.zones
 
     # TODO: factor the following three methods, as they are the same logic
     # between Azure and AWS.
@@ -249,12 +264,11 @@ class Azure(clouds.Cloud):
             # TODO(zhwu): our azure subscription offer ID does not support spot.
             # Need to support it.
             return ([], [])
-        fuzzy_candidate_list = []
         if resources.instance_type is not None:
             assert resources.is_launchable(), resources
             # Treat Resources(AWS, p3.2x, V100) as Resources(AWS, p3.2x).
             resources = resources.copy(accelerators=None)
-            return ([resources], fuzzy_candidate_list)
+            return ([resources], [])
 
         def _make(instance_list):
             resource_list = []
@@ -264,16 +278,22 @@ class Azure(clouds.Cloud):
                     instance_type=instance_type,
                     # Setting this to None as Azure doesn't separately bill /
                     # attach the accelerators.  Billed as part of the VM type.
-                    accelerators=None)
+                    accelerators=None,
+                    cpus=None,
+                )
                 resource_list.append(r)
             return resource_list
 
         # Currently, handle a filter on accelerators only.
         accelerators = resources.accelerators
         if accelerators is None:
-            # No requirements to filter, so just return a default VM type.
-            return (_make([Azure.get_default_instance_type()]),
-                    fuzzy_candidate_list)
+            # Return a default instance type with the given number of vCPUs.
+            default_instance_type = Azure.get_default_instance_type(
+                cpus=resources.cpus)
+            if default_instance_type is None:
+                return ([], [])
+            else:
+                return (_make([default_instance_type]), [])
 
         assert len(accelerators) == 1, resources
         acc, acc_count = list(accelerators.items())[0]
@@ -281,6 +301,7 @@ class Azure(clouds.Cloud):
         ) = service_catalog.get_instance_type_for_accelerator(
             acc,
             acc_count,
+            cpus=resources.cpus,
             use_spot=resources.use_spot,
             region=resources.region,
             zone=resources.zone,

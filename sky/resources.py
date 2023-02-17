@@ -41,16 +41,15 @@ class Resources:
         # TODO:
         sky.Resources(requests={'mem': '16g', 'cpu': 8})
     """
-    # If any fields changed:
-    # 1. Increment the version. For backward compatibility.
-    # 2. Change the __setstate__ method to handle the new fields.
-    # 3. Modify the to_config method to handle the new fields.
-    _VERSION = 6
+    # If any fields changed, increment the version. For backward compatibility,
+    # modify the __setstate__ method to handle the old version.
+    _VERSION = 7
 
     def __init__(
         self,
         cloud: Optional[clouds.Cloud] = None,
         instance_type: Optional[str] = None,
+        cpus: Union[None, int, float, str] = None,
         accelerators: Union[None, str, Dict[str, int]] = None,
         accelerator_args: Optional[Dict[str, str]] = None,
         use_spot: Optional[bool] = None,
@@ -83,16 +82,25 @@ class Resources:
         else:
             self._disk_size = _DEFAULT_DISK_SIZE_GB
 
+        # self._image_id is a dict of {region: image_id}.
+        # The key is None if the same image_id applies for all regions.
         self._image_id = image_id
         if isinstance(image_id, str):
-            self._image_id = {self._region: image_id}
-        elif isinstance(image_id, dict) and None in image_id:
-            self._image_id = {self._region: image_id[None]}
+            self._image_id = {self._region: image_id.strip()}
+        elif isinstance(image_id, dict):
+            if None in image_id:
+                self._image_id = {self._region: image_id[None].strip()}
+            else:
+                self._image_id = {
+                    k.strip(): v.strip() for k, v in image_id.items()
+                }
 
+        self._set_cpus(cpus)
         self._set_accelerators(accelerators, accelerator_args)
 
         self._try_validate_local()
         self._try_validate_instance_type()
+        self._try_validate_cpus()
         self._try_validate_accelerators()
         self._try_validate_spot()
         self._try_validate_image_id()
@@ -128,6 +136,10 @@ class Resources:
             if self.accelerator_args is not None:
                 accelerator_args = f', accelerator_args={self.accelerator_args}'
 
+        cpus = ''
+        if self.cpus is not None:
+            cpus = f', cpus={self.cpus}'
+
         if isinstance(self.cloud, clouds.Local):
             return f'{self.cloud}({self.accelerators})'
 
@@ -153,7 +165,7 @@ class Resources:
 
         hardware_str = (
             f'{instance_type}{use_spot}'
-            f'{accelerators}{accelerator_args}{image_id}{disk_size}')
+            f'{cpus}{accelerators}{accelerator_args}{image_id}{disk_size}')
         # It may have leading ',' (for example, instance_type not set) or empty
         # spaces.  Remove them.
         while hardware_str and hardware_str[0] in (',', ' '):
@@ -180,6 +192,19 @@ class Resources:
     @property
     def instance_type(self):
         return self._instance_type
+
+    @property
+    def cpus(self) -> Optional[str]:
+        """Returns the number of vCPUs that each instance must have.
+
+        For example, cpus='4' means each instance must have exactly 4 vCPUs,
+        and cpus='4+' means each instance must have at least 4 vCPUs.
+
+        (Developer note: The cpus field is only used to select the instance type
+        at launch time. Thus, Resources in the backend's ResourceHandle will
+        always have the cpus field set to None.)
+        """
+        return self._cpus
 
     @property
     def accelerators(self) -> Optional[Dict[str, int]]:
@@ -219,6 +244,36 @@ class Resources:
     @property
     def image_id(self) -> Optional[Dict[str, str]]:
         return self._image_id
+
+    def _set_cpus(
+        self,
+        cpus: Union[None, int, float, str],
+    ) -> None:
+        if cpus is None:
+            self._cpus = None
+            return
+
+        self._cpus = str(cpus)
+        if isinstance(cpus, str):
+            if cpus.endswith('+'):
+                num_cpus_str = cpus[:-1]
+            else:
+                num_cpus_str = cpus
+
+            try:
+                num_cpus = float(num_cpus_str)
+            except ValueError:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'The "cpus" field should be either a number or '
+                        f'a string "<number>+". Found: {cpus!r}') from None
+        else:
+            num_cpus = float(cpus)
+
+        if num_cpus <= 0:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    f'The "cpus" field should be positive. Found: {cpus!r}')
 
     def _set_accelerators(
         self,
@@ -368,6 +423,30 @@ class Resources:
                 f'inferred from the instance_type {self.instance_type!r}.')
             self._cloud = valid_clouds[0]
 
+    def _try_validate_cpus(self) -> None:
+        if self.cpus is None:
+            return
+        if self.instance_type is not None:
+            # The assertion should be true because we have already executed
+            # _try_validate_instance_type() before this method.
+            # The _try_validate_instance_type() method infers and sets
+            # self.cloud if self.instance_type is not None.
+            assert self.cloud is not None
+            cpus = self.cloud.get_vcpus_from_instance_type(self.instance_type)
+            if self.cpus.endswith('+'):
+                if cpus < float(self.cpus[:-1]):
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            f'{self.instance_type} does not have enough vCPUs. '
+                            f'{self.instance_type} has {cpus} vCPUs, '
+                            f'but {self.cpus} is requested.')
+            elif cpus != float(self.cpus):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'{self.instance_type} does not have the requested '
+                        f'number of vCPUs. {self.instance_type} has {cpus} '
+                        f'vCPUs, but {self.cpus} is requested.')
+
     def _try_validate_accelerators(self) -> None:
         """Validate accelerators against the instance type and region/zone."""
         acc_requested = self.accelerators
@@ -484,7 +563,7 @@ class Resources:
                 region_str = f' ({region})' if region else ''
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
-                        f'Image tag {image_id} is not valid, please make sure'
+                        f'Image tag {image_id!r} is not valid, please make sure'
                         f' the tag exists in {self._cloud}{region_str}.')
 
             if (self._cloud.is_same_cloud(clouds.AWS()) and
@@ -518,62 +597,6 @@ class Resources:
             hourly_cost += self.cloud.accelerators_to_hourly_cost(
                 self.accelerators, self.use_spot, self._region, self._zone)
         return hourly_cost * hours
-
-    def is_same_resources(self, other: 'Resources') -> bool:
-        """Returns whether two resources are the same.
-
-        Returns True if they are the same, False if not.
-        """
-        if (self.cloud is None) != (other.cloud is None):
-            # self and other's cloud should be both None or both not None
-            return False
-
-        if self.cloud is not None and not self.cloud.is_same_cloud(other.cloud):
-            return False
-        # self.cloud == other.cloud
-
-        if (self.region is None) != (other.region is None):
-            # self and other's region should be both None or both not None
-            return False
-
-        if self.region is not None and self.region != other.region:
-            return False
-        # self.region <= other.region
-
-        if (self.zone is None) != (other.zone is None):
-            # self and other's zone should be both None or both not None
-            return False
-
-        if self.zone is not None and self.zone != other.zone:
-            return False
-
-        if (self.image_id is None) != (other.image_id is None):
-            # self and other's image id should be both None or both not None
-            return False
-
-        if (self.image_id is not None and self.image_id != other.image_id):
-            return False
-
-        if (self._instance_type is not None and
-                self._instance_type != other.instance_type):
-            return False
-        # self._instance_type == other.instance_type
-
-        other_accelerators = other.accelerators
-        accelerators = self.accelerators
-        if accelerators != other_accelerators:
-            return False
-        # self.accelerators == other.accelerators
-
-        if self.accelerator_args != other.accelerator_args:
-            return False
-        # self.accelerator_args == other.accelerator_args
-
-        if self.use_spot != other.use_spot:
-            return False
-
-        # self == other
-        return True
 
     def less_demanding_than(self,
                             other: Union[List['Resources'], 'Resources'],
@@ -670,6 +693,7 @@ class Resources:
         return all([
             self.cloud is None,
             self._instance_type is None,
+            self.cpus is None,
             self.accelerators is None,
             self.accelerator_args is None,
             not self._use_spot_specified,
@@ -681,6 +705,7 @@ class Resources:
         resources = Resources(
             cloud=override.pop('cloud', self.cloud),
             instance_type=override.pop('instance_type', self.instance_type),
+            cpus=override.pop('cpus', self.cpus),
             accelerators=override.pop('accelerators', self.accelerators),
             accelerator_args=override.pop('accelerator_args',
                                           self.accelerator_args),
@@ -719,6 +744,8 @@ class Resources:
                 config.pop('cloud'))
         if config.get('instance_type') is not None:
             resources_fields['instance_type'] = config.pop('instance_type')
+        if config.get('cpus') is not None:
+            resources_fields['cpus'] = str(config.pop('cpus'))
         if config.get('accelerators') is not None:
             resources_fields['accelerators'] = config.pop('accelerators')
         if config.get('accelerator_args') is not None:
@@ -752,6 +779,7 @@ class Resources:
 
         add_if_not_none('cloud', str(self.cloud))
         add_if_not_none('instance_type', self.instance_type)
+        add_if_not_none('cpus', self.cpus)
         add_if_not_none('accelerators', self.accelerators)
         add_if_not_none('accelerator_args', self.accelerator_args)
 
@@ -775,19 +803,19 @@ class Resources:
         if version is None:
             version = -1
         if version < 0:
-            cloud = state.pop('cloud')
+            cloud = state.pop('cloud', None)
             state['_cloud'] = cloud
 
-            instance_type = state.pop('instance_type')
+            instance_type = state.pop('instance_type', None)
             state['_instance_type'] = instance_type
 
-            use_spot = state.pop('use_spot')
+            use_spot = state.pop('use_spot', False)
             state['_use_spot'] = use_spot
 
-            accelerator_args = state.pop('accelerator_args')
+            accelerator_args = state.pop('accelerator_args', None)
             state['_accelerator_args'] = accelerator_args
 
-            disk_size = state.pop('disk_size')
+            disk_size = state.pop('disk_size', _DEFAULT_DISK_SIZE_GB)
             state['_disk_size'] = disk_size
 
         if version < 2:
@@ -803,12 +831,19 @@ class Resources:
             self._zone = None
 
         if version < 6:
-            accelerators = state.pop('_accelerators')
+            accelerators = state.pop('_accelerators', None)
             if accelerators is not None:
                 accelerators = {
                     accelerator_registry.canonicalize_accelerator_name(acc):
                     acc_count for acc, acc_count in accelerators.items()
                 }
             state['_accelerators'] = accelerators
+
+        if version < 7:
+            self._cpus = None
+
+        image_id = state.get('_image_id', None)
+        if isinstance(image_id, str):
+            state['_image_id'] = {state.get('_region', None): image_id}
 
         self.__dict__.update(state)
