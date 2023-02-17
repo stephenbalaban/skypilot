@@ -935,8 +935,9 @@ class RetryingVmProvisioner(object):
             zones = [clouds.Zone(name=to_provision.zone)
                     ] if to_provision.zone is not None else None
             if zones is None:
-                # Reuse the zone field in the ray yaml as the prev_resources.zone
-                # field may not be set before the previous cluster is launched.
+                # Reuse the zone field in the ray yaml as the
+                # prev_resources.zone field may not be set before the previous
+                # cluster is launched.
                 handle = global_user_state.get_handle_from_cluster_name(
                     cluster_name)
                 assert handle is not None, cluster_name
