@@ -415,7 +415,8 @@ def set_cluster_metadata(cluster_name: str, metadata: Dict[str, Any]) -> None:
         raise ValueError(f'Cluster {cluster_name} not found.')
 
 
-def _get_cluster_usage_intervals(cluster_hash: str) -> Optional[Dict[str, Any]]:
+def _get_cluster_usage_intervals(
+        cluster_hash: str) -> Optional[List[Tuple[str, Optional[str]]]]:
     rows = _DB.cursor.execute(
         'SELECT usage_intervals FROM cluster_history WHERE cluster_hash=(?)',
         (cluster_hash,))
@@ -423,6 +424,7 @@ def _get_cluster_usage_intervals(cluster_hash: str) -> Optional[Dict[str, Any]]:
         if usage_intervals is None:
             return None
         return pickle.loads(usage_intervals)
+    return None
 
 
 def _get_cluster_launch_time(cluster_hash: str) -> Optional[Dict[str, Any]]:
@@ -432,6 +434,8 @@ def _get_cluster_launch_time(cluster_hash: str) -> Optional[Dict[str, Any]]:
 
 def _get_cluster_duration(cluster_hash: str) -> Optional[Dict[str, Any]]:
     usage_intervals = _get_cluster_usage_intervals(cluster_hash)
+    if usage_intervals is None:
+        return None
 
     total_duration = 0
     for i, (start_time, end_time) in enumerate(usage_intervals):

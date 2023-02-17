@@ -2279,7 +2279,7 @@ def get_backend_from_handle(
 
 @typing.overload
 def get_backend_from_handle(
-        handle: backends.Backend.ResourceHandle) -> backends.Backend:
+        handle: backends.ResourceHandle) -> backends.Backend:
     ...
 
 

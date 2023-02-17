@@ -88,12 +88,11 @@ class Optimizer:
         return egress_time
 
     @staticmethod
-    def optimize(
-            dag: 'dag_lib.Dag',
-            minimize=OptimizeTarget.COST,
-            blocked_resources: Optional[Iterable[
+    def optimize(dag: 'dag_lib.Dag',
+                 minimize=OptimizeTarget.COST,
+                 blocked_resources: Optional[Iterable[
                      resources_lib.Resources]] = None,
-            quiet: bool = False):
+                 quiet: bool = False):
         """Find the best execution plan for the given DAG.
 
         Args:

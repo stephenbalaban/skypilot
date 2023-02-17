@@ -553,9 +553,10 @@ class RetryingVmProvisioner(object):
     class ToProvisionConfig:
         """Resources to be provisioned."""
 
-        def __init__(self, cluster_name: str,
-                     resources: resources_lib.Resources, num_nodes: int,
-                     prev_status: global_user_state.ClusterStatus) -> None:
+        def __init__(
+                self, cluster_name: str, resources: resources_lib.Resources,
+                num_nodes: int,
+                prev_status: Optional[global_user_state.ClusterStatus]) -> None:
             assert cluster_name is not None, 'cluster_name must be specified.'
             self.cluster_name = cluster_name
             self.resources = resources
