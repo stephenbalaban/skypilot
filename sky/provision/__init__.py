@@ -1,7 +1,7 @@
 """All provisioners supported by Skypilot."""
 
 import typing
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 import abc
 import importlib
@@ -20,13 +20,6 @@ class ProviderModule(types.ModuleType, metaclass=abc.ABCMeta):
             region: str, cluster_name: str, node_config: Dict[str, Any],
             tags: Dict[str, str], count: int,
             resume_stopped_nodes: bool) -> Dict[str, Any]:
-        pass
-
-    def resume_instances(self,
-                         region: str,
-                         cluster_name: str,
-                         tags: Dict[str, str],
-                         count: Optional[int] = None) -> Dict[str, Any]:
         pass
 
     def stop_instances(self, region: str, cluster_name: str):

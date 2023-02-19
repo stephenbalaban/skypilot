@@ -4,8 +4,11 @@ from typing import List, Dict, Tuple
 import hashlib
 from concurrent import futures
 
+from sky import sky_logging
 from sky.utils import command_runner, subprocess_utils
 from sky.provision import utils as provision_utils
+
+logger = sky_logging.init_logger(__name__)
 
 
 def _parallel_ssh_with_cache(func, cluster_name: str, stage_name: str,

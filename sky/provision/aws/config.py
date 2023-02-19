@@ -14,12 +14,13 @@ import boto3
 from ray.autoscaler._private.cli_logger import cf, cli_logger
 
 from sky import authentication
+from sky import sky_logging
 from sky.provision.aws import utils
 
 # Terraform EC2 instance for reference:
 # https://registry.terraform.io/modules/terraform-aws-modules/ec2-instance/aws/latest
 
-logger = logging.getLogger(__name__)
+logger = sky_logging.init_logger(__name__)
 
 RAY = 'ray-autoscaler'
 DEFAULT_RAY_INSTANCE_PROFILE = RAY + '-v1'

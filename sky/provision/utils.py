@@ -9,7 +9,10 @@ from typing import List, Dict, Optional
 
 import socket
 
+from sky import sky_logging
+
 SKY_CLUSTER_PATH = pathlib.Path.home() / '.sky' / 'clusters'
+logger = sky_logging.init_logger(__name__)
 
 
 def wait_for_ssh(public_ips: List[str]):
@@ -52,7 +55,8 @@ def check_cache_hash_or_update(cluster_name: str, instance_id: str,
             updated = f.read() != hash_str
     else:
         updated = True
-
+    logger.debug(f'Update {cluster_name}/{instance_id}/{stage_name}: '
+                 f'{str(updated)}')
     errored = False
     try:
         yield updated
@@ -84,6 +88,7 @@ def remove_cluster_profile(cluster_name: str) -> None:
     the cluster.
     """
     dirname = SKY_CLUSTER_PATH / cluster_name
+    logger.debug(f'Remove profile of cluster {cluster_name}.')
     shutil.rmtree(dirname, ignore_errors=True)
 
 

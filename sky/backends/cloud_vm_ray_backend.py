@@ -2398,17 +2398,27 @@ class CloudVmRayBackend(backends.Backend):
             if 'handle' in config_dict:
                 handle = config_dict['handle']
                 ip_dict = config_dict['ip_dict']
-                log_path = os.path.join(self.log_dir, 'provision.log')
-                log_abs_path = os.path.abspath(log_path)
-                ip_list = self._post_provision_setup(
-                    repr(handle.launched_resources.cloud),
-                    cluster_name,
-                    to_provision_config,
-                    handle,
-                    local_wheel_path=local_wheel_path,
-                    wheel_hash=wheel_hash,
-                    ip_dict=ip_dict,
-                    log_abs_path=log_abs_path)
+                log_path = os.path.join(self.log_dir,
+                                        'post_provision_setup.log')
+                log_abs_path = os.path.abspath(os.path.expanduser(log_path))
+                fh = logging.FileHandler(log_abs_path)
+                fh.setLevel(logging.DEBUG)
+                try:
+                    logger.addHandler(fh)
+                    ip_list = self._post_provision_setup(
+                        repr(handle.launched_resources.cloud),
+                        cluster_name,
+                        to_provision_config,
+                        handle,
+                        local_wheel_path=local_wheel_path,
+                        wheel_hash=wheel_hash,
+                        ip_dict=ip_dict,
+                        log_abs_path=log_abs_path)
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception('Post provision setup of cluster '
+                                     f'{cluster_name} failed.')
+                    raise
+
                 self._finalize_provisioning_no_lock(handle, task,
                                                     prev_cluster_status,
                                                     ip_list, lock_path)
