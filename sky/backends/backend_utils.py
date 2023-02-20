@@ -1255,15 +1255,13 @@ def _query_head_ip_with_retries(cluster_yaml: str,
 def _query_cluster_ips(cloud_name: str, region: str, cluster_name: str,
                        expected_num_nodes: int, get_internal_ips: bool):
     provider = provision.get(cloud_name)
-    ip_dict = provider.get_instance_ips(region, cluster_name)
-    if get_internal_ips:
-        ips = [pair[0] for k, pair in ip_dict.items()]
-    else:
-        ips = [pair[1] for k, pair in ip_dict.items()]
-    if len(ips) < expected_num_nodes:
+    metadata = provider.get_cluster_metadata(region, cluster_name)
+    if len(metadata.instances) < expected_num_nodes:
         # Simulate the case when Ray head node is not up.
         raise exceptions.FetchIPError(exceptions.FetchIPError.Reason.HEAD)
-    return ips
+    if get_internal_ips:
+        return [pair[0] for pair in metadata.ip_tuples()]
+    return [pair[1] for pair in metadata.ip_tuples()]
 
 
 @timeline.event

@@ -6,12 +6,14 @@ import copy
 import botocore
 
 from sky import sky_logging
+from sky.provision import common
 from sky.provision.aws import utils
 
 BOTO_CREATE_MAX_RETRIES = 5
 
 # Tag uniquely identifying all nodes of a cluster
 TAG_RAY_CLUSTER_NAME = 'ray-cluster-name'
+TAG_SKYPILOT_HEAD_NODE = 'skypilot-head-node'
 
 logger = sky_logging.init_logger(__name__)
 
@@ -119,24 +121,18 @@ def _create_instances(ec2_fail_fast, cluster_name: str, node_config: Dict[str,
                     f'create_instances: Attempt failed with {exc}, retrying.')
 
 
-def create_instances(region: str, cluster_name: str, node_config: Dict[str,
-                                                                       Any],
-                     tags: Dict[str, str], count: int) -> List:
-    ec2_fail_fast = utils.create_resource('ec2', region=region, max_attempts=0)
-    return _create_instances(ec2_fail_fast, cluster_name, node_config, tags,
-                             count)
-
-
-def create_or_resume_instances(region: str, cluster_name: str,
-                               node_config: Dict[str, Any],
-                               tags: Dict[str, str], count: int,
-                               resume_stopped_nodes: bool) -> Dict[str, Any]:
-    """Creates instances.
-
-    Returns dict mapping instance id to ec2.Instance object for the created
-    instances.
-    """
+def start_instances(region: str, cluster_name: str, node_config: Dict[str, Any],
+                    tags: Dict[str, str], count: int,
+                    resume_stopped_nodes: bool) -> common.ProvisionMetadata:
+    """Start instances."""
     ec2 = utils.create_resource('ec2', region=region)
+
+    region = ec2.meta.client.meta.region_name
+    zone = None
+    head_instance_id = None
+    resumed_instance_ids: List[str] = []
+    created_instance_ids: List[str] = []
+
     # sort tags by key to support deterministic unit test stubbing
     tags = dict(sorted(copy.deepcopy(tags).items()))
     filters = [
@@ -150,6 +146,15 @@ def create_or_resume_instances(region: str, cluster_name: str,
         },
     ]
     exist_instances = list(ec2.instances.filter(Filters=filters))
+    exist_instances.sort(key=lambda x: x.id)
+
+    for inst in exist_instances:
+        # TAG_SKYPILOT_HEAD_NODE
+        for t in inst.tags:
+            if t['Key'] == TAG_SKYPILOT_HEAD_NODE and t['Value'] == '1':
+                head_instance_id = inst.id
+                break
+
     pending_instances = []
     running_instances = []
     stopping_instances = []
@@ -168,6 +173,20 @@ def create_or_resume_instances(region: str, cluster_name: str,
         else:
             raise RuntimeError(f'Impossible state "{state}".')
 
+    def _create_head_node_tag(target_instance) -> str:
+        head_node_tag = [{'Key': TAG_SKYPILOT_HEAD_NODE, 'Value': '1'}]
+        ec2.meta.client.create_tags(
+            Resources=[target_instance.id],
+            Tags=target_instance.tags + head_node_tag,
+        )
+        return target_instance.id
+
+    if head_instance_id is None:
+        if running_instances:
+            head_instance_id = _create_head_node_tag(running_instances[0])
+        elif pending_instances:
+            head_instance_id = _create_head_node_tag(pending_instances[0])
+
     # TODO(suquark): Maybe in the future, users could adjust the number
     #  of instances dynamically. Then this case would not be an error.
     if resume_stopped_nodes and len(exist_instances) > count:
@@ -178,15 +197,10 @@ def create_or_resume_instances(region: str, cluster_name: str,
                            'This is likely a resource leak. '
                            'Use "sky down" to terminate the cluster.')
 
-    result = {
-        'region': ec2.meta.client.meta.region_name,
-        'resumed_instances': {},
-        'new_instances': {}
-    }
     to_start_count = count - len(running_instances) - len(pending_instances)
 
     if running_instances:
-        result['zone'] = running_instances[0].placement['AvailabilityZone']
+        zone = running_instances[0].placement['AvailabilityZone']
 
     if to_start_count < 0:
         raise RuntimeError('The number of running+pending instances '
@@ -206,6 +220,7 @@ def create_or_resume_instances(region: str, cluster_name: str,
             stopped_instances.append(inst)
 
         resumed_instances = stopped_instances[:to_start_count]
+        resumed_instances.sort(key=lambda x: x.id)
         resumed_instances_ids = [t.id for t in resumed_instances]
         ec2.meta.client.start_instances(InstanceIds=resumed_instances_ids)
         if tags:
@@ -214,21 +229,49 @@ def create_or_resume_instances(region: str, cluster_name: str,
                 Resources=resumed_instances_ids,
                 Tags=_format_tags(tags),
             )
-        result['resumed_instances'] = {n.id: n for n in resumed_instances}
-        result['zone'] = resumed_instances[0].placement['AvailabilityZone']
+            for inst in resumed_instances:
+                inst.tags = _format_tags(tags)  # sync the tags info
+        placement_zone = resumed_instances[0].placement['AvailabilityZone']
+        if zone is None:
+            zone = placement_zone
+        elif zone != placement_zone:
+            logger.warning(f'Resumed instances are in zone {placement_zone}, '
+                           f'while previous instances are in zone {zone}.')
         to_start_count -= len(resumed_instances)
+
+        if head_instance_id is None:
+            head_instance_id = _create_head_node_tag(resumed_instances[0])
 
     if to_start_count > 0:
         # TODO(suquark): If there are existing instances (already running or
         #  resumed), then we cannot guarantee that they will be in the same
         #  availability zone (when there are multiple zones specified).
         #  This is a known issue before.
-        new_instances = create_instances(region, cluster_name, node_config,
-                                         tags, to_start_count)
-        result['new_instances'] = {n.id: n for n in new_instances}
-        result['zone'] = new_instances[0].placement['AvailabilityZone']
+        ec2_fail_fast = utils.create_resource('ec2',
+                                              region=region,
+                                              max_attempts=0)
+        created_instances = _create_instances(ec2_fail_fast, cluster_name,
+                                              node_config, tags, to_start_count)
+        created_instances.sort(key=lambda x: x.id)
 
-    return result
+        created_instance_ids = [n.id for n in created_instances]
+        placement_zone = created_instances[0].placement['AvailabilityZone']
+        if zone is None:
+            zone = placement_zone
+        elif zone != placement_zone:
+            logger.warning('Newly created instances are in zone '
+                           f'{placement_zone}, '
+                           f'while previous instances are in zone {zone}.')
+
+        if head_instance_id is None:
+            head_instance_id = _create_head_node_tag(created_instances[0])
+
+    assert head_instance_id is not None
+    return common.ProvisionMetadata(region=region,
+                                    zone=zone,
+                                    head_instance_id=head_instance_id,
+                                    resumed_instances_ids=resumed_instance_ids,
+                                    created_instance_ids=created_instance_ids)
 
 
 def stop_instances(region: str, cluster_name: str):
@@ -341,7 +384,10 @@ def wait_instances(region: str, cluster_name: str, state: str):
     waiter.wait(WaiterConfig={'Delay': 5, 'MaxAttempts': 120}, Filters=filters)
 
 
-def get_instance_ips(region: str, cluster_name: str):
+def get_cluster_metadata(region: str,
+                         cluster_name: str) -> common.ClusterMetadata:
+    instances = {}
+    head_instance_id = None
     ec2 = utils.create_resource('ec2', region=region)
     filters = [
         {
@@ -353,8 +399,27 @@ def get_instance_ips(region: str, cluster_name: str):
             'Values': [cluster_name],
         },
     ]
-    instances = ec2.instances.filter(Filters=filters)
-    # TODO: use 'Name' in inst.tags instead of 'id'
-    ips = [(inst.id, (inst.private_ip_address, inst.public_ip_address))
-           for inst in instances]
-    return dict(sorted(ips))
+    ec2_instances = ec2.instances.filter(Filters=filters)
+    for inst in ec2_instances:
+        tags = {}
+        for t in inst.tags:
+            tags[t['Key']] = t['Value']
+            if t['Key'] == TAG_SKYPILOT_HEAD_NODE and t['Value'] == '1':
+                if head_instance_id is not None:
+                    logger.warning('There are multiple head nodes in the '
+                                   'cluster. It is likely that something '
+                                   'goes wrong.')
+                head_instance_id = inst.id
+        # sort tags by key to support deterministic unit test stubbing
+        tags = dict(sorted(tags.items(), key=lambda x: x[0]))
+        instances[inst.id] = common.InstanceMetadata(
+            instance_id=inst.id,
+            private_ip=inst.private_ip_address,
+            public_ip=inst.public_ip_address,
+            tags=tags,
+        )
+    instances = dict(sorted(instances.items(), key=lambda x: x[0]))
+    return common.ClusterMetadata(
+        instances=instances,
+        head_instance_id=head_instance_id,
+    )

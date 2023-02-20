@@ -1,37 +1,39 @@
 """Setup dependencies & services during provisioning."""
 import os
-from typing import List, Dict, Tuple
+from typing import List, Dict
 import hashlib
 from concurrent import futures
 
 from sky import sky_logging
 from sky.utils import command_runner, subprocess_utils
+from sky.provision import common
 from sky.provision import utils as provision_utils
 
 logger = sky_logging.init_logger(__name__)
 
 
 def _parallel_ssh_with_cache(func, cluster_name: str, stage_name: str,
-                             digest: str, ip_dict: Dict,
+                             digest: str,
+                             cluster_metadata: common.ClusterMetadata,
                              ssh_credentials: Dict[str, str]):
     with futures.ThreadPoolExecutor(max_workers=32) as pool:
         results = []
-        for instance_id, (private_ip, public_ip) in ip_dict.items():
-            del private_ip
-            runner = command_runner.SSHCommandRunner(public_ip,
+        for instance_id, metadata in cluster_metadata.instances.items():
+            runner = command_runner.SSHCommandRunner(metadata.public_ip,
                                                      **ssh_credentials)
             wrapper = provision_utils.cache_func(cluster_name, instance_id,
                                                  stage_name, digest)
             log_dir_abs = provision_utils.get_log_dir(cluster_name, instance_id)
             log_path_abs = str(log_dir_abs / (stage_name + '.log'))
-            results.append(pool.submit(wrapper(func), runner, log_path_abs))
+            results.append(
+                pool.submit(wrapper(func), runner, metadata, log_path_abs))
 
         for future in results:
             future.result()
 
 
 def internal_dependencies_setup(cluster_name: str, setup_commands: List[str],
-                                ip_dict: Dict[str, Tuple[str, str]],
+                                cluster_metadata: common.ClusterMetadata,
                                 ssh_credentials: Dict[str, str]):
     # compute the digest
     digests = []
@@ -42,7 +44,9 @@ def internal_dependencies_setup(cluster_name: str, setup_commands: List[str],
         hasher.update(d)
     digest = hasher.hexdigest()
 
-    def _setup_node(runner: command_runner.SSHCommandRunner, log_path: str):
+    def _setup_node(runner: command_runner.SSHCommandRunner,
+                    metadata: common.InstanceMetadata, log_path: str):
+        del metadata
         for cmd in setup_commands:
             returncode, stdout, stderr = runner.run(cmd,
                                                     stream_logs=False,
@@ -59,7 +63,7 @@ def internal_dependencies_setup(cluster_name: str, setup_commands: List[str],
                              cluster_name,
                              stage_name='internal_dependencies_setup',
                              digest=digest,
-                             ip_dict=ip_dict,
+                             cluster_metadata=cluster_metadata,
                              ssh_credentials=ssh_credentials)
 
 
@@ -159,18 +163,23 @@ def _internal_file_mounts(file_mounts: Dict,
         )
 
 
-def internal_file_mounts(cluster_name: str, file_mounts: Dict,
-                         ip_dict: Dict[str, Tuple[str, str]],
+def internal_file_mounts(cluster_name: str, common_file_mounts: Dict,
+                         head_node_file_mounts: Dict,
+                         cluster_metadata: common.ClusterMetadata,
                          ssh_credentials: Dict[str, str], wheel_hash: str):
     """Executes file mounts - rsyncing local files and
     copying from remote stores."""
 
-    def _setup_node(runner: command_runner.SSHCommandRunner, log_path: str):
-        _internal_file_mounts(file_mounts, runner, log_path)
+    def _setup_node(runner: command_runner.SSHCommandRunner,
+                    metadata: common.InstanceMetadata, log_path: str):
+        if metadata.instance_id == cluster_metadata.head_instance_id:
+            _internal_file_mounts(head_node_file_mounts, runner, log_path)
+        else:
+            _internal_file_mounts(common_file_mounts, runner, log_path)
 
     _parallel_ssh_with_cache(_setup_node,
                              cluster_name,
                              stage_name='internal_file_mounts',
                              digest=wheel_hash,
-                             ip_dict=ip_dict,
+                             cluster_metadata=cluster_metadata,
                              ssh_credentials=ssh_credentials)
