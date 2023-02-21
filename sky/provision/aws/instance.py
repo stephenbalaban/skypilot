@@ -221,12 +221,12 @@ def start_instances(region: str, cluster_name: str, node_config: Dict[str, Any],
 
         resumed_instances = stopped_instances[:to_start_count]
         resumed_instances.sort(key=lambda x: x.id)
-        resumed_instances_ids = [t.id for t in resumed_instances]
-        ec2.meta.client.start_instances(InstanceIds=resumed_instances_ids)
+        resumed_instance_ids = [t.id for t in resumed_instances]
+        ec2.meta.client.start_instances(InstanceIds=resumed_instance_ids)
         if tags:
             # empty tags will result in error in the API call
             ec2.meta.client.create_tags(
-                Resources=resumed_instances_ids,
+                Resources=resumed_instance_ids,
                 Tags=_format_tags(tags),
             )
             for inst in resumed_instances:
@@ -270,7 +270,7 @@ def start_instances(region: str, cluster_name: str, node_config: Dict[str, Any],
     return common.ProvisionMetadata(region=region,
                                     zone=zone,
                                     head_instance_id=head_instance_id,
-                                    resumed_instances_ids=resumed_instance_ids,
+                                    resumed_instance_ids=resumed_instance_ids,
                                     created_instance_ids=created_instance_ids)
 
 
@@ -286,6 +286,7 @@ def stop_instances(region: str, cluster_name: str):
             'Values': [cluster_name],
         },
     ]
+    # TODO(suquark): wait pending clusters?
     ec2.instances.filter(Filters=filters).stop()
 
 
@@ -302,6 +303,7 @@ def terminate_instances(region: str, cluster_name: str):
             'Values': [cluster_name],
         },
     ]
+    # TODO(suquark): wait pending clusters?
     # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Instance
     ec2.instances.filter(Filters=filters).terminate()
 
@@ -361,15 +363,13 @@ def wait_instances(region: str, cluster_name: str, state: str):
     ]
 
     if state != 'terminated':
-        # NOTE: there could be a terminated AWS cluster with the same
-        # cluster name.
+        # NOTE: there could be a terminated/terminating AWS cluster with
+        # the same cluster name.
         # Wait the cluster result in errors (cannot wait for 'terminated').
-        # So here we exclude terminated instances.
+        # So here we exclude terminated/terminating instances.
         filters.append({
             'Name': 'instance-state-name',
-            'Values': [
-                'pending', 'running', 'shutting-down', 'stopping', 'stopped'
-            ],
+            'Values': ['pending', 'running', 'stopping', 'stopped'],
         })
 
     if state == 'running':

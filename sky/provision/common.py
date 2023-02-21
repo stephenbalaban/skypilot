@@ -12,6 +12,12 @@ class ProvisionMetadata:
     resumed_instance_ids: List[str]
     created_instance_ids: List[str]
 
+    def is_instance_just_booted(self, instance_id: str) -> bool:
+        """Is an instance just booted,
+        so that there are no services running?"""
+        return (instance_id in self.resumed_instance_ids or
+                instance_id in self.created_instance_ids)
+
 
 @dataclasses.dataclass
 class InstanceMetadata:
@@ -40,3 +46,8 @@ class ClusterMetadata:
             else:
                 other_ips.append(pair)
         return head_node_ip + other_ips
+
+    def get_head_instance(self) -> Optional[InstanceMetadata]:
+        if self.head_instance_id is None:
+            return None
+        return self.instances[self.head_instance_id]

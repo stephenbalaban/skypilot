@@ -67,19 +67,12 @@ def internal_dependencies_setup(cluster_name: str, setup_commands: List[str],
                              ssh_credentials=ssh_credentials)
 
 
-def start_ray(ssh_runners: List[command_runner.SSHCommandRunner],
-              head_private_ip: str,
-              check_ray_started: bool = False):
-    if check_ray_started:
-        returncode = ssh_runners[0].run('ray status', stream_logs=False)
-        if returncode == 0:
-            return
-
+def start_ray_head_node(ssh_runner: command_runner.SSHCommandRunner):
     ray_prlimit = (
         'which prlimit && for id in $(pgrep -f raylet/raylet); '
         'do sudo prlimit --nofile=1048576:1048576 --pid=$id || true; done;')
 
-    returncode, stdout, stderr = ssh_runners[0].run(
+    returncode, stdout, stderr = ssh_runner.run(
         'ray stop; ray start --disable-usage-stats --head '
         '--port=6379 --object-manager-port=8076;' + ray_prlimit,
         stream_logs=False,
@@ -90,6 +83,16 @@ def start_ray(ssh_runners: List[command_runner.SSHCommandRunner],
                            f'===== stdout ===== \n{stdout}\n'
                            f'===== stderr ====={stderr}')
 
+
+def start_ray_worker_nodes(ssh_runners: List[command_runner.SSHCommandRunner],
+                           head_private_ip: str):
+    if not ssh_runners:
+        return
+
+    ray_prlimit = (
+        'which prlimit && for id in $(pgrep -f raylet/raylet); '
+        'do sudo prlimit --nofile=1048576:1048576 --pid=$id || true; done;')
+
     def _setup_ray_worker(runner: command_runner.SSHCommandRunner):
         # for cmd in config_from_yaml['worker_start_ray_commands']:
         #     cmd = cmd.replace('$RAY_HEAD_IP', ip_list[0][0])
@@ -99,8 +102,7 @@ def start_ray(ssh_runners: List[command_runner.SSHCommandRunner],
                           stream_logs=False,
                           require_outputs=True)
 
-    results = subprocess_utils.run_in_parallel(_setup_ray_worker,
-                                               ssh_runners[1:])
+    results = subprocess_utils.run_in_parallel(_setup_ray_worker, ssh_runners)
     for returncode, stdout, stderr in results:
         if returncode:
             raise RuntimeError('Failed to start ray on the worker node '

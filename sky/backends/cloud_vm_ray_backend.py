@@ -30,7 +30,6 @@ from sky import global_user_state
 from sky import resources as resources_lib
 from sky import sky_logging
 from sky import optimizer
-from sky import provision
 from sky import skypilot_config
 from sky import spot as spot_lib
 from sky import task as task_lib
@@ -40,8 +39,6 @@ from sky.backends import backend_utils
 from sky.backends import cloud_vm_backend
 from sky.backends import onprem_utils
 from sky.backends import wheel_utils
-from sky.provision import common as provision_comm
-from sky.provision import setup as provision_setup
 from sky.provision import utils as provision_utils
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -1225,8 +1222,12 @@ class RetryingVmProvisioner(object):
                                                             region)
 
                 provision_metadata = cloud_vm_backend.bulk_provision(
-                    to_provision.cloud, region, zones, handle,
-                    is_prev_cluster_healthy, log_abs_path)
+                    to_provision.cloud,
+                    region,
+                    zones,
+                    handle,
+                    is_prev_cluster_healthy,
+                    log_dir=self.log_dir)
                 # We ship the cluster handle to reuse some configurations.
                 # TODO(suquark): In the future, we should gradually use the
                 #  handle (which includes latest cluster launch results)
@@ -2258,7 +2259,6 @@ class CloudVmRayBackend(backends.Backend):
                 ip_list = cloud_vm_backend.post_provision_setup(
                     repr(handle.launched_resources.cloud),
                     cluster_name,
-                    to_provision_config.cluster_exists,
                     handle,
                     local_wheel_path=local_wheel_path,
                     wheel_hash=wheel_hash,
@@ -2377,101 +2377,6 @@ class CloudVmRayBackend(backends.Backend):
                                                       ip_list, auth_config)
 
             common_utils.remove_file_if_exists(lock_path)
-
-    def _post_provision_setup(
-            self, cloud_name: str, cluster_name: str,
-            to_provision_config: RetryingVmProvisioner.ToProvisionConfig,
-            handle: ResourceHandle, local_wheel_path: pathlib.Path,
-            wheel_hash: str,
-            provision_metadata: provision_comm.ProvisionMetadata,
-            log_abs_path: str):
-        style = colorama.Style
-        # TODO(suquark): in the future, we only need to mount credentials
-        #  for controllers.
-        # TODO(suquark): make use of log path
-        del log_abs_path
-
-        cluster_metadata = provision.get(cluster_name).get_cluster_metadata(
-            provision_metadata.region, cluster_name)
-        # update launched resources
-        handle.launched_resources = (handle.launched_resources.copy(
-            region=provision_metadata.region, zone=provision_metadata.zone))
-        handle.stable_internal_external_ips = cluster_metadata.ip_tuples()
-
-        # TODO(suquark): Move wheel build here in future PRs.
-        config_from_yaml = common_utils.read_yaml(handle.cluster_yaml)
-        ip_tuples = cluster_metadata.ip_tuples()
-        ip_list = [t[1] for t in ip_tuples]
-
-        # TODO(suquark): Handle TPU VMs when dealing with GCP later.
-        if tpu_utils.is_tpu_vm_pod(handle.launched_resources):
-            logger.info(f'{style.BRIGHT}Setting up TPU VM Pod workers...'
-                        f'{style.RESET_ALL}')
-            RetryingVmProvisioner._tpu_pod_setup(  # pylint: disable=protected-access
-                None, handle.cluster_yaml, handle)
-
-        # TODO(suquark): support ssh proxy
-        logger.debug(f'Waiting SSH connection for "{cluster_name}" ...')
-        with backend_utils.safe_console_status(
-                f'[bold cyan]Waiting SSH connection for '
-                f'[green]{cluster_name}[white] ...'):
-            provision_utils.wait_for_ssh([t[1] for t in ip_tuples])
-
-        ssh_credentials = backend_utils.ssh_credential_from_yaml(
-            handle.cluster_yaml)
-        runners = command_runner.SSHCommandRunner.make_runner_list(
-            ip_list, **ssh_credentials)
-
-        # we mount the metadata with sky wheel for speedup
-        # TODO(suquark): only mount credentials for spot controller.
-        metadata_path = provision_utils.generate_metadata(
-            cloud_name, cluster_name)
-        common_file_mounts = {
-            backend_utils.SKY_REMOTE_PATH + '/' + wheel_hash:
-                str(local_wheel_path),
-            backend_utils.SKY_REMOTE_METADATA_PATH: str(metadata_path),
-        }
-        head_node_file_mounts = {
-            **common_file_mounts,
-            **config_from_yaml.get('file_mounts', {})
-        }
-
-        with backend_utils.safe_console_status(
-                f'[bold cyan]Mounting internal files for '
-                f'[green]{cluster_name}[white] ...'):
-            provision_setup.internal_file_mounts(cluster_name,
-                                                 common_file_mounts,
-                                                 head_node_file_mounts,
-                                                 cluster_metadata,
-                                                 ssh_credentials,
-                                                 wheel_hash=wheel_hash)
-
-        with backend_utils.safe_console_status(
-                f'[bold cyan]Running setup commands for '
-                f'[green]{cluster_name}[white] ...'):
-            provision_setup.internal_dependencies_setup(
-                cluster_name, config_from_yaml['setup_commands'],
-                cluster_metadata, ssh_credentials)
-
-        if to_provision_config.cluster_exists:
-            with backend_utils.safe_console_status(
-                    f'[bold cyan]Checking Ray status for '
-                    f'[green]{cluster_name}[white] ...'):
-                provision_setup.start_ray(runners, ip_tuples[0][0], True)
-            with backend_utils.safe_console_status(
-                    f'[bold cyan]Checking Skylet status for '
-                    f'[green]{cluster_name}[white] ...'):
-                provision_setup.start_skylet(runners[0])
-        else:
-            with backend_utils.safe_console_status(
-                    f'[bold cyan]Starting Ray for '
-                    f'[green]{cluster_name}[white] ...'):
-                provision_setup.start_ray(runners, ip_tuples[0][0])
-            with backend_utils.safe_console_status(
-                    f'[bold cyan]Starting Skylet for '
-                    f'[green]{cluster_name}[white] ...'):
-                provision_setup.start_skylet(runners[0])
-        return ip_list
 
     def _sync_workdir(self, handle: ResourceHandle, workdir: Path) -> None:
         # Even though provision() takes care of it, there may be cases where

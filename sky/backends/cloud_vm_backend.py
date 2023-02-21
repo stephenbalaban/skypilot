@@ -188,18 +188,22 @@ def teardown_cluster(cloud_name: str, region: str, cluster_name: str,
 
 
 def _post_provision_setup(cloud_name: str, cluster_name: str,
-                          cluster_exists: bool,
                           handle: 'CloudVmRayBackend.ResourceHandle',
                           local_wheel_path: pathlib.Path, wheel_hash: str,
-                          provision_metadata: provision_comm.ProvisionMetadata,
-                          log_abs_path: str):
+                          provision_metadata: provision_comm.ProvisionMetadata):
     # TODO(suquark): in the future, we only need to mount credentials
     #  for controllers.
-    # TODO(suquark): make use of log path
-    del log_abs_path
 
-    cluster_metadata = provision.get(cluster_name).get_cluster_metadata(
+    cluster_metadata = provision.get(cloud_name).get_cluster_metadata(
         provision_metadata.region, cluster_name)
+
+    logger.debug(f'Provision metadata: {repr(provision_metadata)}\n'
+                 f'Cluster metadata: {repr(cluster_metadata)}')
+
+    head_instance = cluster_metadata.get_head_instance()
+    if head_instance is None:
+        raise RuntimeError(f'Provision failed for cluster "{cluster_name}". '
+                           'Could not find any head instance.')
     # update launched resources
     handle.launched_resources = (handle.launched_resources.copy(
         region=provision_metadata.region, zone=provision_metadata.zone))
@@ -226,8 +230,6 @@ def _post_provision_setup(cloud_name: str, cluster_name: str,
 
     ssh_credentials = backend_utils.ssh_credential_from_yaml(
         handle.cluster_yaml)
-    runners = command_runner.SSHCommandRunner.make_runner_list(
-        ip_list, **ssh_credentials)
 
     # we mount the metadata with sky wheel for speedup
     # TODO(suquark): only mount credentials for spot controller.
@@ -258,29 +260,56 @@ def _post_provision_setup(cloud_name: str, cluster_name: str,
             cluster_name, config_from_yaml['setup_commands'], cluster_metadata,
             ssh_credentials)
 
-    if cluster_exists:
+    head_runner = command_runner.SSHCommandRunner(head_instance.public_ip,
+                                                  **ssh_credentials)
+
+    with backend_utils.safe_console_status(
+            f'[bold cyan]Checking and starting Skylet for '
+            f'[green]{cluster_name}[white] ...'):
+        provision_setup.start_skylet(head_runner)
+
+    full_ray_setup = True
+    if not provision_metadata.is_instance_just_booted(
+            head_instance.instance_id):
+        # Check if head node Ray is alive
         with backend_utils.safe_console_status(
                 f'[bold cyan]Checking Ray status for '
                 f'[green]{cluster_name}[white] ...'):
-            provision_setup.start_ray(runners, ip_tuples[0][0], True)
+            returncode = head_runner.run('ray status', stream_logs=False)
+        if returncode:
+            logger.error('Check result: Head node Ray is not up.')
+        else:
+            logger.debug('Check result: Head node Ray is up.')
+        full_ray_setup = bool(returncode)
+
+    if full_ray_setup:
+        logger.debug('Start Ray on the whole cluster.')
         with backend_utils.safe_console_status(
-                f'[bold cyan]Checking Skylet status for '
+                f'[bold cyan]Starting Ray on the head node for '
                 f'[green]{cluster_name}[white] ...'):
-            provision_setup.start_skylet(runners[0])
+            provision_setup.start_ray_head_node(head_runner)
+        runners = command_runner.SSHCommandRunner.make_runner_list(
+            ip_list[1:], **ssh_credentials)
     else:
+        logger.debug('Start Ray only on worker nodes.')
+        worker_ips = []
+        for inst in cluster_metadata.instances.values():
+            if provision_metadata.is_instance_just_booted(inst.instance_id):
+                worker_ips.append(inst.public_ip)
+        runners = command_runner.SSHCommandRunner.make_runner_list(
+            worker_ips, **ssh_credentials)
+
+    if runners:
         with backend_utils.safe_console_status(
-                f'[bold cyan]Starting Ray for '
+                f'[bold cyan]Starting Ray on the worker nodes for '
                 f'[green]{cluster_name}[white] ...'):
-            provision_setup.start_ray(runners, ip_tuples[0][0])
-        with backend_utils.safe_console_status(
-                f'[bold cyan]Starting Skylet for '
-                f'[green]{cluster_name}[white] ...'):
-            provision_setup.start_skylet(runners[0])
+            provision_setup.start_ray_worker_nodes(runners,
+                                                   head_instance.private_ip)
+
     return ip_list
 
 
 def post_provision_setup(cloud_name: str, cluster_name: str,
-                         cluster_exists: bool,
                          handle: 'CloudVmRayBackend.ResourceHandle',
                          local_wheel_path: pathlib.Path, wheel_hash: str,
                          provision_metadata: provision_comm.ProvisionMetadata,
@@ -293,12 +322,10 @@ def post_provision_setup(cloud_name: str, cluster_name: str,
         logger.addHandler(fh)
         return _post_provision_setup(cloud_name,
                                      cluster_name,
-                                     cluster_exists,
                                      handle,
                                      local_wheel_path=local_wheel_path,
                                      wheel_hash=wheel_hash,
-                                     provision_metadata=provision_metadata,
-                                     log_abs_path=log_abs_path)
+                                     provision_metadata=provision_metadata)
     except Exception:  # pylint: disable=broad-except
         logger.exception('Post provision setup of cluster '
                          f'{cluster_name} failed.')
